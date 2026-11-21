@@ -28,19 +28,57 @@ jobs:
       - name: Install deps
         run: npm install --no-audit --no-fund
 
-      - name: Build dmg + zip
+      - name: Build dmg
         run: npx electron-builder --mac --${{ matrix.arch }} --publish never
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
 
-      - name: List output
-        run: ls -lh release || true
+      - name: Rename with edition label
+        run: |
+          ls -lh release || true
+          for f in release/*.dmg; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            case "${{ matrix.edition }}" in
+              classic) new="TradeDocs-classic-${base#TradeDocs-}" ;;
+              salesinvoice) new="TradeDocs-salesinvoice-${base#TradeDocs-}" ;;
+            esac
+            mv "$f" "release/$new"
+            echo "renamed -> $new"
+          done
+          ls -lh release || true
 
-      - name: Upload artifacts
+      - name: Upload dmg artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.edition }}-mac-${{ matrix.arch }}
-          path: |
-            ${{ matrix.edition }}/release/*.dmg
-            ${{ matrix.edition }}/release/*.zip
+          path: ${{ matrix.edition }}/release/*.dmg
           if-no-files-found: warn
+
+  release:
+    name: Publish to GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Show files
+        run: ls -lh dist
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: mac-${{ github.run_number }}
+          name: TradeDocs macOS build #${{ github.run_number }}
+          body: |
+            经典版 + 销售发票版 · macOS（arm64 / x64）
+            未签名：首次打开请右键 → 打开，或终端执行
+            `xattr -dr com.apple.quarantine /Applications/TradeDocs.app`
+          files: dist/*.dmg
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
