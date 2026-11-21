@@ -1,0 +1,37 @@
+{
+  "name": "外贸单证工作台 TradeDocs",
+  "short_name": "外贸单证",
+  "description": "本地离线外贸单证工具：报价单、形式发票 PI、销售合同、商业发票、装箱单，多语言模板，一键导出 PDF，数据全部保存在本机。",
+  "lang": "zh-CN",
+  "dir": "ltr",
+  "id": "tradedocs-workbench",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#eef1f6",
+  "theme_color": "#16233a",
+  "categories": ["business", "productivity", "finance"],
+  "prefer_related_applications": false,
+  "icons": [
+    { "src": "./icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "./icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "./icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "screenshots": [
+    { "src": "./icons/shot-wide.png", "sizes": "1440x900", "type": "image/png", "form_factor": "wide", "label": "桌面端：左侧表单 + 右侧实时预览" }
+  ],
+  "file_handlers": [
+    { "action": "./index.html?import=1", "accept": { "application/json": [".json"] } }
+  ],
+  "launch_handler": { "client_mode": "focus-existing" },
+  "shortcuts": [
+    { "name": "新建报价单", "short_name": "报价单", "url": "./index.html?type=quotation" },
+    { "name": "新建形式发票", "short_name": "PI", "url": "./index.html?type=pi" },
+    { "name": "新建销售合同", "short_name": "合同", "url": "./index.html?type=contract" },
+    { "name": "新建商业发票", "short_name": "CI", "url": "./index.html?type=ci" },
+    { "name": "新建装箱单", "short_name": "PL", "url": "./index.html?type=pl" }
+  ]
+}

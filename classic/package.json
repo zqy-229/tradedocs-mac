@@ -1,0 +1,121 @@
+{
+  "name": "tradedocs",
+  "productName": "外贸单证工作台",
+  "version": "1.10.9",
+  "description": "本地离线外贸单证工作台：报价单、形式发票 PI、销售合同、商业发票、装箱单",
+  "author": "TradeDocs",
+  "editionLabel": "经典版",
+  "license": "MIT",
+  "private": true,
+  "main": "electron/main.cjs",
+  "scripts": {
+    "app": "electron .",
+    "app:dev": "electron . --dev",
+    "sync": "node scripts/sync-version.mjs",
+    "sync:check": "node scripts/sync-version.mjs --check",
+    "prebuild": "node scripts/sync-version.mjs",
+    "dist": "node scripts/sync-version.mjs && electron-builder --win --x64",
+    "dist:portable": "node scripts/sync-version.mjs && electron-builder --win portable --x64",
+    "dist:nsis": "node scripts/sync-version.mjs && electron-builder --win nsis --x64",
+    "dist:dir": "node scripts/sync-version.mjs && electron-builder --win --x64 --dir",
+    "verify": "node tests/verify-package.mjs",
+    "dist:free": "node scripts/build-edition.mjs free",
+    "dist:licensed": "node scripts/build-edition.mjs licensed",
+    "dist:mac": "node scripts/sync-version.mjs && electron-builder --mac --arm64 --x64 --publish never",
+    "dist:mac:arm": "node scripts/sync-version.mjs && electron-builder --mac --arm64",
+    "dist:mac:x64": "node scripts/sync-version.mjs && electron-builder --mac --x64"
+  },
+  "devDependencies": {
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.tradedocs.workbench",
+    "productName": "TradeDocs",
+    "copyright": "外贸单证工作台 TradeDocs",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "index.html",
+      "manifest.json",
+      "sw.js",
+      "server.mjs",
+      "css/**/*",
+      "js/**/*",
+      "icons/**/*",
+      "electron/**/*",
+      "docs/*.md",
+      "!js/test-smoke.js",
+      "!**/*.map",
+      "!tests/**",
+      "!scripts/**",
+      "!release/**",
+      "!backups/**",
+      "!build/**",
+      "!tools/**",
+      "!tools/keygen/private-key.json",
+      "!tools/keygen/private-key.pem"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "TradeDocs-${version}-激活版-x64.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "外贸单证工作台",
+      "installerLanguages": [
+        "zh_CN",
+        "en_US"
+      ],
+      "language": "2052",
+      "deleteAppDataOnUninstall": false
+    },
+    "portable": {
+      "artifactName": "TradeDocs-${version}-激活版-便携版.${ext}"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "category": "public.app-category.business",
+      "icon": "build/icon.png",
+      "darkModeSupport": false,
+      "artifactName": "TradeDocs-${version}-mac-${arch}.${ext}",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false
+    }
+  }
+}

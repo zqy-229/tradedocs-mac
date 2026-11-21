@@ -1,0 +1,1345 @@
+/* =============================================================
+ * 应用状态中心 —— 单据草稿、自动保存、编号递增、资料库
+ * 所有写操作都落到本机 IndexedDB
+ * ============================================================= */
+
+import * as db from './db.js';
+import { STORES } from './db.js';
+import { uid, debounce, clone, today, addDays, num } from './util.js';
+import { newDoc, migrateDoc, docMeta, DOC_TYPE_KEYS, buildDocNo, parseDocNo, emptyParty, emptyItem, emptyBank,
+  isFixedFormatDoc, docLangChoices, fallbackDocLang } from './schema.js';
+import { DOC_TYPES } from './schema.js';
+import { fillSample } from './sample.js';
+import { recalcDoc } from './calc.js';
+import { getTemplate, tableLabels } from './templates.js';
+import { setUiLang, getUiLang, t } from './i18n.js';
+
+const SETTING_KEYS = {
+  uiLang: 'uiLang',
+  docLang: 'defaultDocLang',
+  company: 'company',
+  companyLogo: 'companyLogo',
+  numbering: 'numbering',
+  currency: 'defaultCurrency',
+  incoterms: 'defaultIncoterms',
+  paymentTerms: 'defaultPaymentTerms',
+  leadTime: 'defaultLeadTime',
+  clauses: 'defaultClauses',
+  rates: 'exchangeRates',
+  theme: 'theme',
+  layout: 'layout',
+  split: 'split',
+  previewVisible: 'previewVisible',
+  prefillSample: 'prefillSample',
+};
+
+const DEFAULT_NUMBERING = {
+  quotation: { prefix: 'QT', next: 1, digits: 3, withDate: false },
+  pi: { prefix: 'PI', next: 1, digits: 3, withDate: false },
+  contract: { prefix: 'SC', next: 1, digits: 3, withDate: false },
+  ci: { prefix: 'CI', next: 1, digits: 3, withDate: false },
+  pl: { prefix: 'PL', next: 1, digits: 3, withDate: false },
+  /* ============ 融合 TradeKit 新增单据编号 ============ */
+  bill_of_lading: { prefix: 'BL', next: 1, digits: 3, withDate: false },
+  certificate_of_origin: { prefix: 'CO', next: 1, digits: 3, withDate: false },
+  customs_declaration: { prefix: 'CD', next: 1, digits: 3, withDate: false },
+  inspection_certificate: { prefix: 'IC', next: 1, digits: 3, withDate: false },
+  fumigation_certificate: { prefix: 'FC', next: 1, digits: 3, withDate: false },
+  beneficiary_certificate: { prefix: 'BC', next: 1, digits: 3, withDate: false },
+  shipper_letter_instruction: { prefix: 'SL', next: 1, digits: 3, withDate: false },
+  insurance_policy: { prefix: 'IP', next: 1, digits: 3, withDate: false },
+  cost_estimation: { prefix: 'CE', next: 1, digits: 3, withDate: false },
+};
+
+/** 单据状态：draft = 草稿（还在改）；saved = 已保存单据（定稿，可发客户） */
+export const DOC_STATUS = { DRAFT: 'draft', SAVED: 'saved' };
+
+export const state = {
+  doc: null,                 // 当前编辑单据
+  docs: [],                  // 全部单据（含草稿与已保存）
+  company: emptyParty(),     // 公司（卖方）默认信息
+  companyLogo: '',           // 默认 LOGO（DataURL）
+  numbering: clone(DEFAULT_NUMBERING),
+  uiLang: 'zh',
+  docLang: 'en',
+  currency: 'USD',
+  incoterms: 'FOB',
+  paymentTerms: 'T/T 30% deposit, 70% before shipment',
+  leadTime: '25-30 days after deposit',
+  rates: { USD: 7.15, EUR: 7.8, THB: 0.2, CNY: 1 },
+  theme: 'blue',             // 主题配色：blue/red/green/purple/graphite/navy/orange
+  layout: 'top',             // 界面布局：top（顶栏式，默认，简约统一）/ side（侧栏式）
+  split: 42,                 // 编辑区宽度百分比（拖动分栏条改变）
+  previewVisible: true,      // 是否显示右侧预览
+  prefillSample: false,      // 新建单据时是否预填一份完整示例（默认关：新建=空白+灰色示例提示）
+  customers: [],
+  products: [],
+  clauses: [],
+  profiles: [],              // 常用公司档案（卖方抬头历史）
+  banks: [],                 // 收款银行档案（一键套用到单据银行信息）
+  history: {},               // 字段输入历史：{ 'companyName': [{value,count,lastUsed}], ... }
+  zoom: 0.87,
+  saveState: 'idle',         // idle | saving | saved | error
+  lastSavedAt: 0,
+  ready: false,
+  collapsible: {},           // 表单区块折叠状态
+};
+
+/** 草稿列表（未定稿） */
+export function draftDocs() {
+  return state.docs.filter((d) => d.status !== 'saved');
+}
+
+/** 已保存单据列表（已定稿，可发客户） */
+export function savedDocs() {
+  return state.docs.filter((d) => d.status === 'saved');
+}
+
+/** 统计：各类型草稿数 / 已保存数 */
+export function docCounts() {
+  const out = {};
+  for (const d of DOC_TYPE_KEYS) out[d] = { draft: 0, saved: 0, total: 0 };
+  for (const doc of state.docs) {
+    const bucket = out[doc.type] || (out[doc.type] = { draft: 0, saved: 0, total: 0 });
+    if (doc.status === 'saved') bucket.saved += 1; else bucket.draft += 1;
+    bucket.total += 1;
+  }
+  return out;
+}
+
+/* ---------------- 事件总线 ---------------- */
+
+const listeners = new Map();
+
+export function on(event, handler) {
+  if (!listeners.has(event)) listeners.set(event, new Set());
+  listeners.get(event).add(handler);
+  return () => listeners.get(event).delete(handler);
+}
+
+export function emit(event, payload) {
+  const set = listeners.get(event);
+  if (!set) return;
+  set.forEach((fn) => {
+    try { fn(payload); } catch (err) { console.error(`[${event}]`, err); }
+  });
+}
+
+/* ---------------- 初始化 ---------------- */
+
+export async function init() {
+  // 设置
+  const s = await db.getSettings(Object.values(SETTING_KEYS));
+  const browserLang = (navigator.language || '').toLowerCase().startsWith('zh') ? 'zh' : 'en';
+  state.uiLang = s[SETTING_KEYS.uiLang] || browserLang;
+  state.docLang = s[SETTING_KEYS.docLang] || 'en';
+  state.company = { ...emptyParty(), ...(s[SETTING_KEYS.company] || {}) };
+  state.companyLogo = s[SETTING_KEYS.companyLogo] || '';
+  state.numbering = { ...clone(DEFAULT_NUMBERING), ...(s[SETTING_KEYS.numbering] || {}) };
+  state.currency = s[SETTING_KEYS.currency] || 'USD';
+  state.incoterms = s[SETTING_KEYS.incoterms] || 'FOB';
+  state.paymentTerms = s[SETTING_KEYS.paymentTerms] || 'T/T 30% deposit, 70% before shipment';
+  state.leadTime = s[SETTING_KEYS.leadTime] || '25-30 days after deposit';
+  state.rates = { ...state.rates, ...(s[SETTING_KEYS.rates] || {}) };
+  state.theme = s.theme || 'blue';
+  state.layout = s.layout || 'top';
+  // 重新布局：统一为顶栏式，避免侧栏菜单与顶部导航重复导致的杂乱（用户可在设置里切换回侧栏式）
+  state.layout = 'top';
+  db.setSetting('layout', 'top');
+  // 用户偏好浅色界面：初始化时关闭夜间模式（顶栏固定浅色，编辑区回到浅色）
+  state.split = Number(s.split) > 0 ? Number(s.split) : 42;
+  state.previewVisible = s.previewVisible !== false;
+  // 默认关闭：新建出来是空白单据（只有自己的公司信息/编号/日期）+ 每个格子的灰色填写示例
+  state.prefillSample = s.prefillSample === true;
+
+  setUiLang(state.uiLang);
+
+  // 资料库
+  await refreshLibraries();
+  await refreshProfiles();
+  await refreshBanks();
+
+  // 输入历史（用于下拉自动补全）
+  await loadHistory();
+
+  // 单据草稿
+  await refreshDocs();
+
+  state.ready = true;
+  emit('ready', state);
+  return state;
+}
+
+export async function refreshDocs() {
+  const rows = await db.listDocs();
+  state.docs = rows.map(migrateDoc).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  return state.docs;
+}
+
+export async function refreshLibraries() {
+  const [customers, products, clauses] = await Promise.all([
+    db.getAll(STORES.customers),
+    db.getAll(STORES.products),
+    db.getAll(STORES.clauses),
+  ]);
+  state.customers = customers.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  // 产品排序：先置顶（常用），再按手动调整的顺序，最后按名称（同序时稳定）
+  state.products = products.sort((a, b) => {
+    const pin = (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0);
+    if (pin) return pin;
+    const ao = a.order === undefined || a.order === null ? 1e9 : Number(a.order);
+    const bo = b.order === undefined || b.order === null ? 1e9 : Number(b.order);
+    if (ao !== bo) return ao - bo;
+    return String(a.name || '').localeCompare(String(b.name || ''));
+  });
+  state.clauses = clauses.sort((a, b) => String(a.category || '').localeCompare(String(b.category || '')));
+  return { customers, products, clauses };
+}
+
+/* ---------------- 输入历史（下拉自动补全） ---------------- */
+
+/**
+ * 会被记录历史的字段清单
+ * 注意：产品行的数量/单价不记录（每单都不同，记了反而是噪音）
+ */
+export const HISTORY_FIELDS = [
+  'seller.companyName', 'seller.contact', 'seller.tel', 'seller.email',
+  'buyer.companyName', 'buyer.contact', 'buyer.tel', 'buyer.email',
+  'consignee.companyName', 'notify.companyName',
+  'destination', 'loadingPort', 'leadTime', 'paymentTerms', 'preparedBy',
+  // 发票类型是自由输入 + 建议下拉，填过的自定义值要记住，下次能直接选
+  'invoiceType',
+  'bank.bankName', 'bank.accountNo', 'bank.swift',
+  /* 报关单：这些是"每票都差不多"的信息，记住后下次直接选（用户诉求：常用信息要能存下来 + 有常用选项） */
+  'declarantName', 'declarantCode', 'declarantPhone',
+  'supervisionMode', 'dutyNature', 'declarationType',
+  'tradeCountry', 'destinationCountry', 'exitCustoms', 'exitPort', 'destPort',
+  'vesselVoyage', 'packageType',
+  'producerName', 'producerCode', 'shipperCreditCode',
+  'declareUnit', 'declareUnitCode',
+  'attachedDocs', 'declarantSignature',
+];
+
+/** 读取当前内存中的历史（原始条目 {value, count, lastUsed}） */
+export function historyOf(key) {
+  const list = state.history[key];
+  return Array.isArray(list) ? list : [];
+}
+
+/**
+ * 只取历史里的字符串值，用于下拉候选
+ * 排序：最近填过的优先，其次按填写次数
+ */
+export function historyValues(key) {
+  return historyOf(key)
+    .slice()
+    .sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0) || (b.count || 0) - (a.count || 0))
+    .map((x) => x.value);
+}
+
+/** 记录一个字段填过的值（去重 + 计数 + 排序 + 截断）
+ *  时间戳用单调递增序列，避免同一毫秒内连写多条导致「最近优先」排序不稳定 */
+let historySeq = 0;
+function nextHistoryStamp() {
+  historySeq = Math.max(historySeq + 1, Date.now());
+  return historySeq;
+}
+
+export async function rememberValue(key, value) {
+  const v = String(value ?? '').trim();
+  if (!key || v.length < 2 || v.length > 160) return null;
+  const list = historyOf(key).slice();
+  const stamp = nextHistoryStamp();
+  const idx = list.findIndex((x) => x.value === v);
+  if (idx >= 0) list[idx] = { value: v, count: (list[idx].count || 1) + 1, lastUsed: stamp };
+  else list.push({ value: v, count: 1, lastUsed: stamp });
+  // 最近使用优先，其次常用；只留前 30 条
+  list.sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0) || (b.count || 0) - (a.count || 0));
+  state.history[key] = list.slice(0, 30);
+  await db.put(STORES.history, { key, values: state.history[key], updatedAt: Date.now() });
+  emit('history', { key });
+  return state.history[key];
+}
+
+/** 清空输入历史 */
+export async function clearHistory() {
+  state.history = {};
+  await db.clear(STORES.history);
+  emit('history', {});
+}
+
+/** 输入历史总条数 */
+export function historyTotal() {
+  return Object.values(state.history).reduce((s, list) => s + (Array.isArray(list) ? list.length : 0), 0);
+}
+
+/** 加载全部输入历史到内存 */
+async function loadHistory() {
+  const rows = await db.getAll(STORES.history);
+  const out = {};
+  for (const r of rows) {
+    if (r && r.key && Array.isArray(r.values)) {
+      out[r.key] = r.values
+        .slice()
+        .sort((a, b) => (b.lastUsed || 0) - (a.lastUsed || 0) || (b.count || 0) - (a.count || 0));
+    }
+  }
+  state.history = out;
+  return out;
+}
+
+/* ---------------- 设置读写 ---------------- */
+
+export async function saveSetting(key, value) {
+  await db.setSetting(key, value);
+}
+
+export async function setUiLanguage(code) {
+  state.uiLang = code;
+  setUiLang(code);
+  await saveSetting(SETTING_KEYS.uiLang, code);
+  emit('uilang', code);
+}
+
+/* ---------------- 主题配色 ---------------- */
+
+/** 可选主题（与 css/app.css 的 html[data-theme=...] 一一对应） */
+export const THEMES = [
+  { code: 'blue', label: '经典蓝', color: '#1f5fd6' },
+  { code: 'red', label: '中国红', color: '#c8232c' },
+  { code: 'green', label: '墨绿', color: '#16785f' },
+  { code: 'purple', label: '典雅紫', color: '#6b3fa0' },
+  { code: 'graphite', label: '石墨金', color: '#b4802a' },
+  { code: 'navy', label: '商务藏青', color: '#1c4e80' },
+  { code: 'orange', label: '暖橙', color: '#d2691e' },
+];
+
+/** 切换主题：同时影响界面与单据版式，并存到本机 */
+export async function setTheme(code) {
+  const ok = THEMES.some((t) => t.code === code) ? code : 'blue';
+  state.theme = ok;
+  await saveSetting('theme', ok);
+  emit('theme', ok);
+  return ok;
+}
+
+export async function setDefaultDocLang(code) {
+  state.docLang = code;
+  await saveSetting(SETTING_KEYS.docLang, code);
+}
+
+export async function saveCompany(party, logo) {
+  state.company = { ...emptyParty(), ...party };
+  if (logo !== undefined) state.companyLogo = logo;
+  // 印章与 LOGO 都随公司保存，下次新建单据自动带上
+  if (party && party.stamp) state.company.stamp = party.stamp;
+  await saveSetting(SETTING_KEYS.company, state.company);
+  await saveSetting(SETTING_KEYS.companyLogo, state.companyLogo);
+  emit('company', state);
+}
+
+export async function saveNumbering(numbering) {
+  state.numbering = numbering;
+  await saveSetting(SETTING_KEYS.numbering, numbering);
+}
+
+export async function saveRates(rates) {
+  state.rates = { ...state.rates, ...rates };
+  await saveSetting(SETTING_KEYS.rates, state.rates);
+}
+
+/* ---------------- 单据编号 ---------------- */
+
+/** 取下一编号（不占用，只计算） */
+export function peekDocNo(type) {
+  const cfg = state.numbering[type] || { prefix: docMeta(type).prefix, next: 1, digits: 3, withDate: false };
+  const used = state.docs
+    .filter((d) => d.type === type)
+    .reduce((max, d) => Math.max(max, parseDocNo(d.docNo, cfg.prefix)), 0);
+  const seq = Math.max(Number(cfg.next) || 1, used + 1);
+  return buildDocNo(cfg.prefix, seq, { digits: cfg.digits, withDate: cfg.withDate });
+}
+
+/** 占用编号（新建单据时递增 next） */
+export async function claimDocNo(type) {
+  const numbering = clone(state.numbering);
+  const cfg = numbering[type] || { prefix: docMeta(type).prefix, next: 1, digits: 3, withDate: false };
+  const used = state.docs
+    .filter((d) => d.type === type)
+    .reduce((max, d) => Math.max(max, parseDocNo(d.docNo, cfg.prefix)), 0);
+  const seq = Math.max(Number(cfg.next) || 1, used + 1);
+  const no = buildDocNo(cfg.prefix, seq, { digits: cfg.digits, withDate: cfg.withDate });
+  numbering[type] = { ...cfg, next: seq + 1 };
+  await saveNumbering(numbering);
+  return no;
+}
+
+/* ---------------- 新建 / 打开 / 保存 ---------------- */
+
+/** 新建空白单据（已自动编号、带入公司信息与默认条款；状态为草稿） */
+/** 新建单据用哪个单据语言：固定格式单据（报关单 / 提单 / 水单）只允许中英 */
+function docLangForNewDoc(type, wanted) {
+  const lang = wanted || state.docLang;
+  if (!isFixedFormatDoc(type)) return lang;
+  return docLangChoices(type).some((l) => l.code === lang) ? lang : fallbackDocLang(type);
+}
+
+export async function createDoc(type, opts = {}) {
+  const meta = docMeta(type);
+  const no = opts.number || (await claimDocNo(type));
+  const doc = newDoc(type, {
+    number: no,
+    // 固定格式单据（报关单 / 提单 / 水单）只支持中英：全局偏好是别的语言时回退默认值
+    docLang: docLangForNewDoc(type, opts.docLang),
+    currency: opts.currency || state.currency,
+    seller: opts.seller || state.company,
+    sourceDocId: opts.sourceDocId,
+  });
+  // 默认公司里存过印章 → 新单据自动带上
+  if (!doc.seller.stamp && state.company.stamp) doc.seller.stamp = state.company.stamp;
+  if (!doc.seller.logo && state.companyLogo) doc.seller.logo = state.companyLogo;
+  // ⚠️ 新建单据要**真空白**：贸易术语 / 付款方式 / 交货期都不再从偏好里预填
+  //（用户反馈：「默认新建是空白的，现在新建还是有数据的」）
+  // 只有显式传进来的才用（一键生成、示例数据会传）
+  doc.incoterms = opts.incoterms || '';
+  doc.paymentTerms = opts.paymentTerms || '';
+  doc.leadTime = opts.leadTime || '';
+
+  // 只有 PI / CI 才带银行收款信息；装箱单不带条款与银行信息
+  const withBank = meta.withBank || type === 'ci';
+  doc.bank = withBank ? { ...emptyBank(), ...(opts.bank || {}) } : emptyBank();
+
+  // 条款：按单据类型取对应默认模板（合同用独立的条款数组）
+  // 条款正文：新建时留空（空白单据）；要模板条款可用表单里的「📄 载入模板」
+  // ⚠️ d 还要给下面的合同条款用（contractClauses），别删
+  const d = getTemplate(doc.docLang).defaults || {};
+  if (opts.terms !== undefined) doc.terms = opts.terms;
+  else doc.terms = '';
+
+  if (meta.withContract) {
+    doc.contractClauses = clone(d.contractClauses || []);
+  }
+  if (opts.items) doc.items = opts.items.map((it, i) => ({ ...emptyItem(i), ...it, order: i }));
+  if (opts.buyer) doc.buyer = { ...emptyParty(), ...opts.buyer };
+  if (opts.marks) doc.marks = opts.marks;
+  if (opts.countryOfOrigin) doc.countryOfOrigin = opts.countryOfOrigin;
+  doc.status = opts.status || DOC_STATUS.DRAFT;   // 新单据默认是草稿
+  doc.savedAt = doc.status === DOC_STATUS.SAVED ? Date.now() : 0;
+  // 默认**不预填**：新建出来是**空白单据**（只有你自己的公司信息 / 编号 / 日期），
+  // 每个格子用浅灰字给出填写示例（见 form.js 的 PH）。
+  // 想让新建就带一整套示例数据照着学，在设置里打开「新建单据时预填完整示例」。
+  if (opts.sample === true || (opts.sample !== false && state.prefillSample === true)) {
+    try { fillSample(doc, { overwrite: false }); } catch { /* 预填失败不影响新建 */ }
+  }
+  recalcDoc(doc);
+  await db.saveDoc(doc);
+  await refreshDocs();
+  emit('docs', state.docs);
+  return doc;
+}
+
+/** 打开草稿（设为当前编辑单据） */
+export async function openDoc(id) {
+  const row = await db.getDoc(id);
+  if (!row) return null;
+  const doc = migrateDoc(row);
+  recalcDoc(doc);
+  state.doc = doc;
+  emit('doc', doc);
+  return doc;
+}
+
+/** 保存当前单据（带修订快照节流） */
+const snapshotThrottle = debounce(async (docId) => {
+  const row = await db.getDoc(docId);
+  if (!row) return;
+  await db.addRevision(docId, clone(row), '自动快照');
+  await db.pruneRevisions(docId, 20);
+  emit('revisions', docId);
+}, 60000);
+
+export async function persistDoc(doc = state.doc) {
+  if (!doc) return null;
+  recalcDoc(doc);
+  doc.updatedAt = Date.now();
+  state.saveState = 'saving';
+  emit('savestate', state.saveState);
+  try {
+    await db.saveDoc(clone(doc));
+    const idx = state.docs.findIndex((d) => d.id === doc.id);
+    const light = clone(doc);
+    if (idx >= 0) state.docs[idx] = light; else state.docs.unshift(light);
+    state.docs.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    state.saveState = 'saved';
+    state.lastSavedAt = Date.now();
+    emit('savestate', state.saveState);
+    emit('docs', state.docs);
+    snapshotThrottle(doc.id);
+    return doc;
+  } catch (err) {
+    state.saveState = 'error';
+    emit('savestate', 'error');
+    throw err;
+  }
+}
+
+/** 自动保存（防抖 600ms，页面隐藏时强制立即保存） */
+export const autosave = debounce(() => {
+  persistDoc().catch((err) => console.error('自动保存失败', err));
+}, 600);
+
+/** 手动触发保存 */
+export function scheduleAutosave() {
+  state.saveState = 'saving';
+  emit('savestate', 'saving');
+  autosave();
+}
+
+export async function flushAutosave() {
+  autosave.flush();
+  await persistDoc();
+}
+
+/* ---------------- 复制 / 生成联动 ---------------- */
+
+/** 复制单据（同类型，新编号；复制出来的是草稿） */
+export async function duplicateDoc(id) {
+  const src = id ? migrateDoc(await db.getDoc(id)) : state.doc;
+  if (!src) return null;
+  const copy = clone(src);
+  copy.id = uid('doc');
+  copy.docNo = await claimDocNo(src.type);
+  copy.date = today();
+  if (src.type === 'quotation' || src.type === 'pi') copy.validUntil = addDays(today(), 30);
+  copy.createdAt = Date.now();
+  copy.updatedAt = Date.now();
+  copy.sourceDocId = src.id;
+  copy.status = DOC_STATUS.DRAFT;      // 副本从草稿开始，确认无误再另存
+  copy.savedAt = 0;
+  await db.saveDoc(copy);
+  await refreshDocs();
+  emit('docs', state.docs);
+  return migrateDoc(copy);
+}
+
+/* ---------------- 草稿 ⇆ 已保存单据 ---------------- */
+
+/**
+ * 把当前单据标记为「已保存单据」（定稿）
+ * 会做基本完整性检查，避免把空单据误存为正式单据
+ * @returns {{ok:boolean, reason?:string, doc?:object}}
+ */
+export async function markDocSaved(doc = state.doc) {
+  if (!doc) return { ok: false, reason: 'no-doc' };
+  if (!String(doc.docNo || '').trim()) return { ok: false, reason: 'no-number' };
+  if (!String(doc.seller?.companyName || '').trim()) return { ok: false, reason: 'no-seller' };
+  if (!String(doc.buyer?.companyName || '').trim()) return { ok: false, reason: 'no-buyer' };
+  const rows = (doc.items || []).filter((it) => String(it.description || '').trim());
+  if (!rows.length) return { ok: false, reason: 'no-items' };
+  doc.status = DOC_STATUS.SAVED;
+  doc.savedAt = Date.now();
+  await persistDoc(doc);
+  emit('status', doc);
+  return { ok: true, doc };
+}
+
+/** 把已保存单据退回草稿（继续修改） */
+export async function markDocDraft(doc = state.doc) {
+  if (!doc) return null;
+  doc.status = DOC_STATUS.DRAFT;
+  doc.savedAt = 0;
+  await persistDoc(doc);
+  emit('status', doc);
+  return doc;
+}
+
+/**
+ * 单据联动：由源单据一键生成目标类型单据
+ * 带入：买卖双方、产品明细、贸易/付款/目的港等
+ * @param {object} source 源单据
+ * @param {string} targetType 目标类型
+ */
+export async function generateFrom(source, targetType) {
+  const src = source || state.doc;
+  if (!src) return null;
+  const target = docMeta(targetType);
+  const no = await claimDocNo(targetType);
+
+  const doc = newDoc(targetType, {
+    number: no,
+    docLang: src.docLang,
+    currency: src.currency,
+    seller: src.seller,
+    sourceDocId: src.id,
+  });
+  doc.status = DOC_STATUS.DRAFT;      // 联动生成的是草稿，确认后再另存
+  doc.savedAt = 0;
+
+  // 买卖双方
+  doc.buyer = clone(src.buyer);
+  doc.consignee = clone(src.consignee || src.buyer);
+  doc.notify = clone(src.notify || src.buyer);
+  // 交易条件
+  doc.incoterms = src.incoterms;
+  doc.destination = src.destination;
+  doc.loadingPort = src.loadingPort;
+  doc.leadTime = src.leadTime;
+  doc.paymentTerms = src.paymentTerms;
+  doc.priceTerms = src.priceTerms;
+  doc.countryOfOrigin = src.countryOfOrigin || 'CHINA';
+  doc.marks = src.marks;
+  doc.remarks = src.remarks;
+  doc.exchangeRate = src.exchangeRate;
+  doc.seller = clone(src.seller);
+  doc.bank = clone(src.bank || emptyBank());
+
+  // 产品明细（保留图片与 HS 编码，方便 CI/PL 复用）
+  doc.items = (src.items || []).map((it, i) => ({
+    ...emptyItem(i),
+    ...clone(it),
+    id: uid('it'),
+    order: i,
+    // 装箱单需要箱数，默认 1 箱并沿用重量体积
+    ctns: it.ctns || 1,
+  }));
+
+  // 条款：按目标单据类型决定，避免带入无关内容
+  // ⚠️ 判断顺序要紧：合同也带银行信息（withBank / withContract 同时为 true），
+  // 必须先判 withContract，否则会当成 PI 处理、丢掉 7 条合同条款。
+  if (target.withContract) {
+    doc.contractClauses = clone(getTemplate(doc.docLang).defaults?.contractClauses || []);
+    doc.terms = '';
+    doc.bank = emptyBank();
+  } else if (target.withBank) {
+    doc.terms = src.terms || getTemplate(doc.docLang).defaults?.piTerms || '';
+  } else if (target.mode === 'packing') {
+    // 装箱单只体现重量体积，不带条款与银行信息
+    doc.terms = '';
+    doc.bank = emptyBank();
+    doc.remarks = src.remarks || '';
+  } else {
+    doc.terms = src.terms || '';
+  }
+
+  recalcDoc(doc);
+  await db.saveDoc(doc);
+  await refreshDocs();
+  emit('docs', state.docs);
+  return migrateDoc(doc);
+}
+
+/* ---------------- 删除 / 恢复 ---------------- */
+
+export async function removeDoc(id) {
+  await db.deleteDoc(id);
+  const revs = await db.listRevisions(id);
+  for (const r of revs) await db.del(STORES.revisions, r.id);
+  if (state.doc && state.doc.id === id) state.doc = null;
+  await refreshDocs();
+  emit('docs', state.docs);
+}
+
+export async function listRevisions(docId) {
+  return db.listRevisions(docId);
+}
+
+export async function restoreRevision(revId, docId) {
+  const rev = await db.get(STORES.revisions, revId);
+  if (!rev) return null;
+  const doc = migrateDoc({ ...clone(rev.snapshot), id: docId, updatedAt: Date.now() });
+  recalcDoc(doc);
+  await db.saveDoc(doc);
+  await refreshDocs();
+  state.doc = doc;
+  emit('docs', state.docs);
+  emit('doc', doc);
+  return doc;
+}
+
+/* ---------------- 资料库：客户 ---------------- */
+
+/**
+ * 统一整理写入用的行：清掉 undefined 的主键
+ * 注意：`{ id: undefined, ...obj }` 会让 id 键存在且为 undefined，
+ * `obj.id || uid()` 虽然能兜底，但一旦顺序写反就会让 IndexedDB 抛 DataError，
+ * 所以这里一律先删干净再补。
+ */
+function normalizeRow(row, prefix) {
+  const out = { ...row };
+  if (out.id === undefined || out.id === null || out.id === '') delete out.id;
+  if (!out.id) out.id = uid(prefix);
+  out.updatedAt = Date.now();
+  return out;
+}
+
+export async function saveCustomer(customer) {
+  const row = normalizeRow(customer, 'cus');
+  await db.put(STORES.customers, row);
+  await refreshLibraries();
+  emit('library', 'customers');
+  return row;
+}
+
+export async function removeCustomer(id) {
+  await db.del(STORES.customers, id);
+  await refreshLibraries();
+  emit('library', 'customers');
+}
+
+/* ---------------- 资料库：产品 ---------------- */
+
+export async function saveProduct(product) {
+  const row = normalizeRow(product, 'prd');
+  // 新产品默认排在最后（order 取当前最大值 +10），老产品保留自己调好的顺序
+  if (row.order === undefined || row.order === null) {
+    const maxOrder = state.products.reduce((m, p) => Math.max(m, Number(p.order) || 0), 0);
+    row.order = maxOrder + 10;
+  }
+  await db.put(STORES.products, row);
+  await refreshLibraries();
+  emit('library', 'products');
+  return row;
+}
+
+/** 手动调整产品顺序：与相邻一条交换 order（delta = -1 上移 / +1 下移） */
+export async function moveProduct(id, delta) {
+  const list = state.products.slice();
+  const i = list.findIndex((p) => p.id === id);
+  const j = i + Number(delta || 0);
+  if (i < 0 || j < 0 || j >= list.length) return false;
+  const a = list[i];
+  const b = list[j];
+  const ao = a.order === undefined || a.order === null ? i : Number(a.order);
+  const bo = b.order === undefined || b.order === null ? j : Number(b.order);
+  a.order = bo;
+  b.order = ao;
+  await db.put(STORES.products, a);
+  await db.put(STORES.products, b);
+  await refreshLibraries();
+  emit('library', 'products');
+  return true;
+}
+
+/** 置顶 / 取消置顶（常用产品固定在列表最上面） */
+export async function togglePinProduct(id) {
+  const p = state.products.find((x) => x.id === id);
+  if (!p) return false;
+  p.pinned = !p.pinned;
+  await db.put(STORES.products, p);
+  await refreshLibraries();
+  emit('library', 'products');
+  return !!p.pinned;
+}
+
+export async function removeProduct(id) {
+  await db.del(STORES.products, id);
+  await refreshLibraries();
+  emit('library', 'products');
+}
+
+/* ---------------- 资料库：条款 ---------------- */
+
+export async function saveClause(clause) {
+  const row = normalizeRow(clause, 'cls');
+  await db.put(STORES.clauses, row);
+  await refreshLibraries();
+  emit('library', 'clauses');
+  return row;
+}
+
+export async function removeClause(id) {
+  await db.del(STORES.clauses, id);
+  await refreshLibraries();
+  emit('library', 'clauses');
+}
+
+export async function updateClause(id, patch) {
+  const row = state.clauses.find((c) => c.id === id);
+  if (!row) return null;
+  return saveClause({ ...row, ...patch, id });
+}
+
+/* ---------------- 常用公司档案（卖方抬头，可增删改） ---------------- */
+
+/** 保存一份公司档案；传 id 则更新，否则新增 */
+export async function saveProfile(profile) {
+  const name = String(profile.companyName || profile.name || '').trim();
+  if (!name) throw new Error('请填写公司名称');
+  const row = normalizeRow({ ...profile, companyName: name, name }, 'pro');
+  await db.put(STORES.profiles, row);
+  await refreshProfiles();
+  emit('library', 'profiles');
+  return row;
+}
+
+export async function removeProfile(id) {
+  await db.del(STORES.profiles, id);
+  await refreshProfiles();
+  emit('library', 'profiles');
+}
+
+/** 把当前单据的卖方信息存成一份档案 */
+export async function saveCurrentSellerAsProfile(doc = state.doc) {
+  if (!doc || !String(doc.seller?.companyName || '').trim()) {
+    throw new Error('请先填写卖方公司名称');
+  }
+  const seller = doc.seller;
+
+  // ⚠️ 同时写入「默认公司」。
+  //    新建单据拿 state.company 当卖方（createDoc），而在此之前
+  //    UI 里没有任何入口能设置它 —— 结果就是「存了常用公司，但新建单据还是空白」。
+  //    帮助里写的也是「存为默认公司」，所以这里两个都存。
+  state.company = { ...emptyParty(), ...state.company, ...seller };
+  await saveSetting(SETTING_KEYS.company, state.company);
+  if (seller.logo) {
+    state.companyLogo = seller.logo;
+    await saveSetting(SETTING_KEYS.companyLogo, state.companyLogo);
+  }
+
+  // 同名则更新，避免存出一堆重复
+  const name = seller.companyName.trim().toLowerCase();
+  const exist = state.profiles.find((p) => String(p.companyName || '').trim().toLowerCase() === name);
+  const row = await saveProfile({ ...seller, id: exist?.id });
+  emit('company', state);
+  return row;
+}
+
+/** 保存一份收款银行档案；传 id 则更新，否则新增 */
+export async function saveBank(bank) {
+  const name = String(bank.bankName || bank.name || '').trim();
+  if (!name) throw new Error('请填写开户银行名称');
+  const row = normalizeRow({ ...bank, bankName: name, name }, 'bk');
+  await db.put(STORES.banks, row);
+  await refreshBanks();
+  emit('library', 'banks');
+  return row;
+}
+
+export async function removeBank(id) {
+  await db.del(STORES.banks, id);
+  await refreshBanks();
+  emit('library', 'banks');
+}
+
+/** 把当前单据的银行信息存成一份档案（同名则更新） */
+export async function saveCurrentBankAsProfile(doc = state.doc) {
+  const b = doc && doc.bank;
+  if (!b || !String(b.bankName || '').trim()) throw new Error('请先填写开户银行');
+  const name = String(b.bankName).trim().toLowerCase();
+  const exist = state.banks.find((x) => String(x.bankName || '').trim().toLowerCase() === name);
+  return saveBank({ ...b, id: exist?.id });
+}
+
+export async function refreshBanks() {
+  const rows = await db.getAll(STORES.banks);
+  state.banks = rows.sort((a, b) => String(a.bankName || '').localeCompare(String(b.bankName || '')));
+  return state.banks;
+}
+
+export async function refreshProfiles() {
+  const rows = await db.getAll(STORES.profiles);
+  state.profiles = rows.sort((a, b) =>
+    String(a.companyName || '').localeCompare(String(b.companyName || '')));
+  return state.profiles;
+}
+
+/* ---------------- 印章 / LOGO（品牌素材） ---------------- */
+
+/**
+ * 把当前单据上的「品牌素材」（印章 / LOGO）存进「默认公司」与同名的常用公司档案。
+ *
+ * 存一次以后：
+ *   · 新建单据会自动带上（见 createDoc 里的 state.companyLogo / state.company.stamp）
+ *   · 「从常用公司选择」也会带上
+ *
+ * ⚠️ 印章和 LOGO 必须走同一条路径。
+ *    之前只有印章有「保存印章」按钮，LOGO 的持久化写在 saveCompany() 里，
+ *    而那个函数**从来没有被调用过** —— 所以 LOGO 上传后无法复用（用户报的 bug）。
+ *    现在两者共用一个实现，不会再各走各的。
+ */
+export async function saveBrandToLibrary({ stamp, logo } = {}) {
+  const doc = state.doc;
+  // 显式传值优先；未传则取当前单据上的
+  const nextStamp = stamp !== undefined ? stamp : (doc?.seller?.stamp || '');
+  const nextLogo = logo !== undefined ? logo : (doc?.seller?.logo || '');
+  if (!nextStamp && !nextLogo) throw new Error('没有可保存的印章或 LOGO');
+
+  // 1) 存进默认公司。
+  //    ⚠️ 这里要把**当前单据的卖方信息一起存进去**（公司名 / 地址 / 联系方式…），
+  //    不只是印章和 LOGO。原因：新建单据是拿 state.company 当卖方的
+  //    （见 createDoc 的 seller: opts.seller || state.company），
+  //    如果只存了图片，新单据会「有 LOGO 但没有公司名」。
+  //    这也正是帮助里写的「填好卖方信息后保存，以后每张单自动带上公司名和 LOGO」。
+  const fromDoc = doc?.seller || {};
+  const identity = Object.fromEntries(
+    Object.entries(fromDoc).filter(([k, v]) =>
+      !['id', 'stamp', 'logo'].includes(k) && typeof v === 'string' && v.trim()),
+  );
+  state.company = { ...emptyParty(), ...state.company, ...identity };
+  if (nextStamp) state.company.stamp = nextStamp;
+  if (nextLogo) {
+    state.company.logo = nextLogo;
+    state.companyLogo = nextLogo;
+    await saveSetting(SETTING_KEYS.companyLogo, state.companyLogo);
+  } else if (!state.companyLogo && state.company.logo) {
+    // 没有新 LOGO 但默认公司里已有 → 保持同步，避免两处不一致
+    state.companyLogo = state.company.logo;
+    await saveSetting(SETTING_KEYS.companyLogo, state.companyLogo);
+  }
+  await saveSetting(SETTING_KEYS.company, state.company);
+
+  // 2) 若有同名常用公司档案，一并更新
+  const name = String(doc?.seller?.companyName || '').trim().toLowerCase();
+  let updated = 0;
+  if (name && state.profiles.length) {
+    const hit = state.profiles.find((p) => String(p.companyName || '').trim().toLowerCase() === name);
+    if (hit) {
+      const patch = { updatedAt: Date.now() };
+      if (nextStamp) patch.stamp = nextStamp;
+      if (nextLogo) patch.logo = nextLogo;
+      await db.put(STORES.profiles, { ...hit, ...patch });
+      await refreshProfiles();
+      updated = 1;
+    }
+  }
+  emit('company', state);
+  return { ok: true, updatedProfiles: updated, savedStamp: !!nextStamp, savedLogo: !!nextLogo };
+}
+
+/** 保存印章（保留旧接口，内部走统一实现） */
+export async function saveStampToLibrary(stampData) {
+  return saveBrandToLibrary({ stamp: stampData });
+}
+
+/** 保存 LOGO —— 用户上传后点「保存 LOGO」，新建单据即自动带上 */
+export async function saveLogoToLibrary(logoData) {
+  return saveBrandToLibrary({ logo: logoData });
+}
+
+/** 读取默认印章 */
+export function defaultStamp() {
+  return state.company?.stamp || '';
+}
+
+/** 读取默认 LOGO */
+export function defaultLogo() {
+  return state.companyLogo || state.company?.logo || '';
+}
+
+/* ============================ 示例数据（测试 / 演示用） ============================ */
+
+/** 生成一枚透明底圆形红章（SVG dataURL），用于示例数据 */
+function demoStamp() {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240">
+<circle cx="120" cy="120" r="112" fill="none" stroke="#c8232c" stroke-width="7"/>
+<circle cx="120" cy="120" r="88" fill="none" stroke="#c8232c" stroke-width="3"/>
+<text x="120" y="70" font-size="30" font-family="SimSun,serif" fill="#c8232c" text-anchor="middle">深圳顺风科技</text>
+<text x="120" y="108" font-size="19" font-family="SimSun,serif" fill="#c8232c" text-anchor="middle">有限公司</text>
+<text x="120" y="146" font-size="16" font-family="SimSun,serif" fill="#c8232c" text-anchor="middle">合同专用章</text>
+<polygon points="120,164 131,190 159,190 137,206 145,234 120,218 95,234 103,206 81,190 109,190" fill="#c8232c"/>
+</svg>`;
+  return `data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(svg)))}`;
+}
+
+const SAMPLE_SELLER = {
+  companyName: 'SHENZHEN SUNVL TECHNOLOGY CO., LTD.',
+  address: 'Room 1203, Building A, Hi-Tech Industrial Park, Nanshan District',
+  city: 'Shenzhen', state: 'Guangdong', zip: '518057', country: 'China',
+  contact: 'Mr. Chen Wei', tel: '+86 755 8888 6666', fax: '+86 755 8888 6667',
+  email: 'sales@sunvl-demo.com', website: 'www.sunvl-demo.com',
+  taxId: '91440300MA5XXXXX0K',
+};
+
+/** 示例客户（覆盖不同国家 / 付款方式，方便试多语言与清关字段） */
+export const SAMPLE_CUSTOMERS = [
+  {
+    companyName: 'Smith Trading LLC', address: '1234 Commerce Street, Suite 500',
+    city: 'New York', state: 'NY', zip: '10001', country: 'USA',
+    contact: 'Mr. John Smith', tel: '+1 212 555 0100', email: 'john.smith@smithtrading.com',
+    taxId: '12-3456789',
+  },
+  {
+    companyName: 'Nice Goods Import GmbH', address: 'Hafenstrasse 22',
+    city: 'Hamburg', state: 'Hamburg', zip: '20359', country: 'Germany',
+    contact: 'Frau Anna Müller', tel: '+49 40 555 0120', email: 'einkauf@nicegoods.de',
+    taxId: 'DE123456789',
+  },
+  {
+    companyName: 'Bangkok Trading Co., Ltd.', address: '88/9 Sukhumvit Road, Klongtoey',
+    city: 'Bangkok', state: 'Bangkok', zip: '10110', country: 'Thailand',
+    contact: 'คุณสมชาย ใจดี', tel: '+66 2 123 4567', email: 'purchase@siam-demo.co.th',
+    taxId: '0105551234567',
+  },
+  {
+    companyName: 'Al Noor General Trading LLC', address: 'Sheikh Zayed Road, Business Bay Tower 3',
+    city: 'Dubai', state: 'Dubai', zip: '00000', country: 'United Arab Emirates',
+    contact: 'Mr. Ahmed Al Noor', tel: '+971 4 555 0180', email: 'import@alnoor-demo.ae',
+    taxId: '100123456700003',
+  },
+  {
+    companyName: 'Pacific Rim Distributors Pty Ltd', address: '45 Collins Street, Level 12',
+    city: 'Melbourne', state: 'VIC', zip: '3000', country: 'Australia',
+    contact: 'Ms. Sarah O\'Brien', tel: '+61 3 5550 1900', email: 'buying@pacificrim.com.au',
+    taxId: '53 004 085 616',
+  },
+];
+
+/** 示例产品（含规格、图片占位、单位，覆盖各单据类型需要的字段） */
+export const SAMPLE_PRODUCTS = [
+  {
+    description: 'Stainless Steel Ball Valve, 1/2 inch, PN16, Full Port',
+    model: 'SV-BV050', hsCode: '8481.80.90', unit: 'pc', unitPrice: 8.5,
+    styleName: 'KH001', size: '1/2 inch', color: 'silver', material: 'SS304',
+    moq: 500, leadTime: '30 days', unitsPerCtn: 60, ctnL: 40, ctnW: 30, ctnH: 25,
+    netWeight: 320, nw: 19.2, gw: 21, meas: 0.03, measUnit: 'm³',
+    specNote: 'Max pressure 16 bar; threaded BSP female ends',
+  },
+  {
+    description: 'Brass Gate Valve, 3/4 inch, with Cast Iron Handle',
+    model: 'SV-GV075', hsCode: '8481.80.10', unit: 'pc', unitPrice: 12.4,
+    styleName: 'KH002', size: '3/4 inch', color: 'golden', material: 'HPb59-1 brass',
+    moq: 300, leadTime: '25 days', unitsPerCtn: 40, ctnL: 35, ctnW: 28, ctnH: 22,
+    netWeight: 410, nw: 16.4, gw: 18, meas: 0.022, measUnit: 'm³',
+    specNote: 'Working temperature -10°C to 120°C',
+  },
+  {
+    description: 'Ceramic Mug 500ml, heat resistant borosilicate',
+    model: 'CM-500', hsCode: '6912.00.00', unit: 'pc', unitPrice: 0.35,
+    styleName: 'KH003', size: '500ml, 90mm×110mm', color: 'white', material: 'borosilicate glass',
+    moq: 3000, leadTime: '35 days', unitsPerCtn: 48, ctnL: 50, ctnW: 40, ctnH: 24,
+    netWeight: 320, nw: 15.4, gw: 16.8, meas: 0.048, measUnit: 'm³',
+    specNote: 'Logo printing available; dishwasher safe',
+  },
+  {
+    description: "Women's 100% Silk Knitted Blouse",
+    model: 'WSB-2026-A', hsCode: '6106.10.00', unit: 'pcs', unitPrice: 25,
+    styleName: 'SS-2601', size: 'S / M / L / XL', color: 'ivory', material: '100% mulberry silk',
+    moq: 200, leadTime: '45 days', unitsPerCtn: 20, ctnL: 60, ctnW: 40, ctnH: 30,
+    netWeight: 180, nw: 4.8, gw: 6.3, meas: 0.072, measUnit: 'm³',
+    specNote: 'Hand wash cold; dry clean recommended',
+  },
+  {
+    description: 'Terminal Clamp MCB, sizes 1200mm × 2000mm',
+    model: 'MD-01905-001', hsCode: '7326.90.90', unit: 'pcs', unitPrice: 0.025,
+    styleName: 'KH004', size: '1200mm × 2000mm', color: 'silver', material: 'SPCC T=1.0',
+    moq: 5000, leadTime: '30 days', unitsPerCtn: 420, ctnL: 60, ctnW: 40, ctnH: 15,
+    netWeight: 200, nw: 9.6, gw: 10.4, meas: 0.036, measUnit: 'm³',
+    specNote: 'Surface treatment: zinc plated',
+  },
+  {
+    description: 'Flexible Hose, 1/2 inch × 60 cm, Braided Stainless Steel',
+    model: 'SV-FH060', hsCode: '8307.10.00', unit: 'pair', unitPrice: 4.75,
+    styleName: 'KH005', size: '1/2 inch × 600mm', color: 'silver', material: 'SS304 braided',
+    moq: 1000, leadTime: '28 days', unitsPerCtn: 100, ctnL: 45, ctnW: 35, ctnH: 30,
+    netWeight: 240, nw: 24, gw: 26, meas: 0.047, measUnit: 'm³',
+    specNote: 'Working pressure 10 bar; EPDM inner tube',
+  },
+  {
+    description: 'Automatic Pet Feeder, 3L, App controlled feeding',
+    model: 'APF-2000', hsCode: '8436800000', unit: 'set', unitPrice: 18.5,
+    styleName: 'AP-01', size: '300×180×260mm', color: 'white/grey', material: 'ABS + PP',
+    moq: 500, leadTime: '25 days', unitsPerCtn: 8, ctnL: 65, ctnW: 45, ctnH: 55,
+    netWeight: 2100, nw: 16.8, gw: 18.5, meas: 0.16, measUnit: 'm³',
+    specNote: 'App remote feeding schedule; stainless steel bowl; CE & RoHS',
+  },
+  {
+    description: 'Silicone Food Bowl, anti-slip non-spill, 500ml',
+    model: 'SFB-300', hsCode: '3924100000', unit: 'pc', unitPrice: 3.2,
+    styleName: 'AP-02', size: '15×15×6cm', color: 'various', material: 'food-grade silicone',
+    moq: 2000, leadTime: '20 days', unitsPerCtn: 100, ctnL: 60, ctnW: 40, ctnH: 30,
+    netWeight: 150, nw: 15, gw: 16.2, meas: 0.07, measUnit: 'm³',
+    specNote: 'BPA free, microwave & dishwasher safe',
+  },
+];
+
+/** 示例条款库 */
+export const SAMPLE_CLAUSES = [
+  {
+    title: 'Payment Terms',
+    body: '30% deposit by T/T upon order confirmation, the balance 70% paid against copy of B/L.',
+  },
+  {
+    title: 'Delivery & Shipment',
+    body: 'Shipment within 30 days after receipt of the deposit. Partial shipment and transhipment are allowed.',
+  },
+  {
+    title: 'Quality & Inspection',
+    body: 'The quality of the goods shall conform to the specification confirmed by both parties. Inspection certificate issued by the manufacturer shall be taken as the basis of delivery.',
+  },
+  {
+    title: 'Packing & Marking',
+    body: 'Goods to be packed in export standard cartons, suitable for long sea transportation. Shipping marks as per buyer\'s instruction.',
+  },
+  {
+    title: 'Force Majeure',
+    body: 'Neither party shall be liable for failure to perform its obligations due to events beyond its reasonable control, including but not limited to natural disasters, war, and government actions.',
+  },
+  {
+    title: 'Claims & Warranty',
+    body: 'Any claim shall be raised within 30 days after arrival of the goods at destination. Warranty period is 12 months from the date of shipment for manufacturing defects.',
+  },
+  {
+    title: 'Arbitration',
+    body: 'Any dispute arising from this contract shall be settled through friendly negotiation. Failing that, the dispute shall be submitted to CIETAC for arbitration in accordance with its rules.',
+  },
+];
+
+const SAMPLE_PROFILES = [
+  {
+    companyName: 'SHENZHEN SUNVL TECHNOLOGY CO., LTD.',
+    address: 'Room 1203, Building A, Hi-Tech Industrial Park, Nanshan District',
+    city: 'Shenzhen', state: 'Guangdong', zip: '518057', country: 'China',
+    contact: 'Mr. Chen Wei', tel: '+86 755 8888 6666', fax: '+86 755 8888 6667',
+    email: 'sales@sunvl-demo.com', taxId: '91440300MA5XXXXX0K',
+  },
+  {
+    companyName: 'NINGBO SUNRISE IMPORT & EXPORT CO., LTD.',
+    address: 'No. 88 Zhongshan East Road, Yinzhou District',
+    city: 'Ningbo', state: 'Zhejiang', zip: '315100', country: 'China',
+    contact: 'Ms. Lin Na', tel: '+86 574 8777 2222', email: 'info@sunrise-demo.com',
+    taxId: '91330200MA2XXXXX8P',
+  },
+  {
+    companyName: 'QINGDAO GOLDEN HARVEST TRADING CO., LTD.',
+    address: 'Floor 18, Hisense Plaza, 17 Hong Kong Middle Road, Shinan District',
+    city: 'Qingdao', state: 'Shandong', zip: '266071', country: 'China',
+    contact: 'Mr. Wang Lei', tel: '+86 532 6666 8888', email: 'export@goldenharvest-demo.com',
+    taxId: '91370200MA3XXXXX2T',
+  },
+];
+
+/**
+ * 载入示例数据：5 类单据 + 客户 / 产品 / 条款 / 常用公司 + 印章
+ * 为安全起见，本机已有单据时拒绝执行，避免覆盖真实数据
+ * @param {boolean} force 强制载入（测试用）
+ */
+export async function loadSampleData(force = false) {
+  const existing = await db.getAll(STORES.docs);
+  if (existing.length && !force) return { ok: false, reason: 'exists' };
+
+  const stamp = demoStamp();
+  const seller = { ...emptyParty(), ...SAMPLE_SELLER, stamp };
+
+  // 默认公司与常用公司
+  state.company = { ...seller };
+  await saveSetting(SETTING_KEYS.company, state.company);
+  for (const p of SAMPLE_PROFILES) {
+    await db.put(STORES.profiles, {
+      ...emptyParty(), ...p,
+      stamp: p.companyName === SAMPLE_SELLER.companyName ? stamp : p.stamp || '',
+      id: uid('pf'), updatedAt: Date.now(),
+    });
+  }
+  await refreshProfiles();
+
+  // 客户库
+  for (const c of SAMPLE_CUSTOMERS) await saveCustomer({ ...c });
+
+  // 产品库
+  for (const p of SAMPLE_PRODUCTS) {
+    await saveProduct({
+      ...p, id: uid('pd'),
+      weightUnit: 'kg', measUnit: 'm³', packUnit: 'ctn',
+      photo: '', remark: '',
+    });
+  }
+
+  // 条款库
+  for (const c of SAMPLE_CLAUSES) await saveClause({ ...c });
+
+  const mkItem = (base, over = {}) => ({
+    ...emptyItem(0), ...base,
+    id: uid('it'), photo: '', ctnNo: '', remark: '',
+    weightUnit: 'kg', measUnit: 'm³', packUnit: 'ctn',
+    ...over,
+  });
+
+  const now = Date.now();
+  const makeDoc = async (type, opts, patch, createdAt) => {
+    const d = await createDoc(type, {
+      seller,
+      ...opts,
+      // 单号沿用各类型默认自增
+    });
+    Object.assign(d, patch);
+    d.seller = { ...seller };
+    d.createdAt = createdAt;
+    d.updatedAt = createdAt;
+    d.status = opts.status || 'draft';
+    if (opts.status === 'saved') d.savedAt = createdAt;
+    recalcDoc(d);
+    await db.put(STORES.docs, d);
+    return d;
+  };
+
+  const c1 = SAMPLE_CUSTOMERS[0];
+  const c2 = SAMPLE_CUSTOMERS[1];
+  const c3 = SAMPLE_CUSTOMERS[2];
+  const c4 = SAMPLE_CUSTOMERS[3];
+
+  const docs = [];
+  // 全部 15 种单据各生成一张英文示例（复用 sample.js 预填案例，贴合出口业务）
+  for (const dt of DOC_TYPES) {
+    const d = await createDoc(dt.type, { seller });
+    fillSample(d);
+    d.docLang = 'en'; d.status = 'saved'; d.savedAt = now;
+    recalcDoc(d);
+    await db.put(STORES.docs, d);
+    docs.push(d);
+  }
+  await refreshDocs();
+  await refreshLibraries();
+  await refreshProfiles();
+
+  state.company = { ...seller };
+  await saveSetting(SETTING_KEYS.company, state.company);
+  emit('demo', { count: docs.length });
+
+  return {
+    ok: true,
+    docs: docs.length,
+    customers: SAMPLE_CUSTOMERS.length,
+    products: SAMPLE_PRODUCTS.length,
+    clauses: SAMPLE_CLAUSES.length,
+    profiles: SAMPLE_PROFILES.length,
+  };
+}
+
+/* ---------------- 按集装箱（柜）拆分成多张装箱单 ---------------- */
+
+/**
+ * 按柜拆分装箱单
+ *
+ * 场景：一票货装 2~3 个柜，货代/报关要「一柜一张箱单」。
+ * 规则：
+ *   · 每个柜生成一张新箱单（草稿），单头带上该柜的柜号/封号/柜型；
+ *   · 明细只放该柜的行（保持原顺序），合计按该柜的行重新求和（不按比例摊分）；
+ *   · 没选柜的行归入「未分配柜」，若存在也单独生成一张，避免漏箱；
+ *   · 原单标记为母单（子单 sourceDocId 指向它），便于追溯与重新拆分。
+ *
+ * @returns {Promise<{docs:Array, skipped:number}>}
+ */
+export async function splitPackingByContainer(source, opts = {}) {
+  // opts.include：只拆这些柜（柜 id 数组；不传=全部）
+  // opts.includeUnassigned：没选柜的行是否也单独成一张（默认 true，避免漏箱）
+  // ⚠️ 只读源单据，**不修改它**（母单要保留）
+  const src = source || state.doc;
+  if (!src) return { docs: [], skipped: 0 };
+  const ctnList = Array.isArray(src.containers) ? src.containers : [];
+  const items = (src.items || []).filter((it) => String(it.description || '').trim() || num(it.ctns));
+  if (!ctnList.length || !items.length) return { docs: [], skipped: 0 };
+
+  const include = Array.isArray(opts.include) ? new Set(opts.include) : null;
+  const includeUnassigned = opts.includeUnassigned !== false;
+  const groups = [];
+  ctnList.forEach((c, idx) => {
+    if (include && !include.has(c.id)) return;
+    const list = items.filter((it) => it.containerId === c.id);
+    if (list.length) groups.push({ ctn: c, idx, list });
+  });
+  const ids = new Set(ctnList.map((c) => c.id));
+  const unassigned = items.filter((it) => !it.containerId || !ids.has(it.containerId));
+  if (unassigned.length && includeUnassigned) groups.push({ ctn: null, idx: -1, list: unassigned });
+
+  const out = [];
+  for (const g of groups) {
+    const suffix = g.ctn ? `-C${g.idx + 1}` : '-C0';
+    // 单号别撞车：已经存在就加 -2 / -3
+    let no = `${src.docNo || 'PL'}${suffix}`;
+    let dup = 2;
+    while (state.docs.some((d) => d.docNo === no)) no = `${src.docNo || 'PL'}${suffix}-${dup++}`;
+    const doc = newDoc('pl', {
+      number: no,
+      docLang: src.docLang,
+      currency: src.currency,
+      seller: clone(src.seller),
+      sourceDocId: src.id,
+    });
+    doc.status = DOC_STATUS.DRAFT;
+    doc.savedAt = 0;
+    // 单头：只带这一张单需要的
+    doc.date = src.date;
+    doc.docType = src.docType || '';
+    doc.buyer = clone(src.buyer);
+    doc.consignee = clone(src.consignee || src.buyer);
+    doc.notify = clone(src.notify || src.buyer);
+    doc.destination = src.destination;
+    doc.loadingPort = src.loadingPort;
+    doc.incoterms = src.incoterms;
+    doc.paymentTerms = src.paymentTerms;
+    doc.leadTime = src.leadTime;
+    doc.priceTerms = src.priceTerms;
+    doc.countryOfOrigin = src.countryOfOrigin;
+    doc.marks = src.marks;
+    doc.bank = clone(src.bank || emptyBank());
+    // 柜信息：本柜 + 备注写清来源
+    doc.containers = g.ctn ? [{ ...clone(g.ctn) }] : [];
+    doc.remarks = [
+      g.ctn
+        ? `由 ${src.docNo || '原箱单'} 第 ${g.idx + 1} 柜（${g.ctn.no || '未填柜号'}）拆分生成`
+        : `由 ${src.docNo || '原箱单'} 拆分生成（未分配柜的行）`,
+      src.remarks || '',
+    ].filter(Boolean).join('；');
+    // 明细
+    doc.items = g.list.map((it, i) => ({
+      ...emptyItem(i),
+      ...clone(it),
+      id: uid('it'),
+      order: i,
+      containerId: g.ctn ? g.ctn.id : '',
+    }));
+    recalcDoc(doc);
+    await persistDoc(doc);
+    out.push(doc);
+  }
+  await refreshDocs();
+  return { docs: out, skipped: 0 };
+}
+
+/* ---------------- 备份 / 清空 ---------------- */
+
+export async function exportBackup() {
+  return db.exportAll();
+}
+
+export async function importBackup(payload, opts) {
+  const stats = await db.importAll(payload, opts);
+  await refreshDocs();
+  await refreshLibraries();
+  await init();
+  emit('docs', state.docs);
+  return stats;
+}
+
+export async function clearAllData() {
+  for (const store of Object.values(STORES)) await db.clear(store);
+
+  state.doc = null;
+  state.docs = [];
+  state.company = emptyParty();
+  state.companyLogo = '';
+  state.history = {};
+  state.profiles = [];
+  state.numbering = clone(DEFAULT_NUMBERING);
+  await refreshDocs();
+  await refreshLibraries();
+  emit('docs', state.docs);
+  emit('doc', null);
+}
+
+/* ---------------- 便捷取值 ---------------- */
+
+export function currentTpl() {
+  return getTemplate(state.doc ? state.doc.docLang : state.docLang);
+}
+
+export function currentTableLabels() {
+  return tableLabels(state.doc ? state.doc.docLang : state.docLang);
+}
+
+export function docTypeTitle(type) {
+  return t(`doc.${type}`);
+}
+
+export { SETTING_KEYS, DEFAULT_NUMBERING };
+export const ALL_DOC_TYPES = DOC_TYPE_KEYS;

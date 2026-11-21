@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>外贸单证工作台 · 销售发票版（Sales Invoice Duplicate）</title>
+  <meta name="description" content="本地离线外贸单证工具：报价单、形式发票 PI、销售合同、商业发票、装箱单，多语言模板，一键导出 PDF，数据 100% 保存在本机。" />
+  <meta name="theme-color" content="#16233a" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="外贸单证" />
+  <link rel="manifest" href="./manifest.json" />
+  <link rel="icon" href="./icons/icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="./icons/icon-192.png" />
+  <link rel="stylesheet" href="./css/app.css" />
+</head>
+<body>
+  <!-- ================= 顶部导航 ================= -->
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-mark">单</div>
+      <div class="brand-text">
+        <span class="brand-name" data-i18n="appName">外贸单证工作台 · 销售发票版</span>
+        <span class="brand-sub" data-i18n="appSub">本地离线 · 数据不上云</span>
+      </div>
+    </div>
+
+    <nav class="doc-tabs" id="docTabs" role="tablist" aria-label="单据模块"></nav>
+
+    <div class="header-actions">
+      
+      <button class="btn btn-ghost btn-sm" id="btnHelp" title="使用帮助（三步就会用）">
+        <svg class="hd-ico" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><span class="btn-label" data-i18n="help.btn">使用帮助</span>
+      </button>
+      <button class="btn btn-ghost btn-sm" id="btnDrafts" title="草稿与已保存单据">
+        <svg class="hd-ico" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg><span class="btn-label" data-i18n="drafts.title">草稿与单据</span>
+      </button>
+      <button class="btn btn-ghost btn-sm" id="btnLibrary" title="模板库">
+        <svg class="hd-ico" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg><span class="btn-label">模板库</span>
+      </button>
+      <button class="btn btn-ghost btn-sm" id="btnSettings" title="设置">
+        <svg class="hd-ico" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg><span class="btn-label" data-i18n="set.title">设置</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- 安装成 App 的提示条（浏览器支持安装时才有内容） -->
+  <div class="install-bar" id="installBar" hidden>
+    
+    <span class="txt"><b data-i18n="pwa.installTitle">装成 App 用</b><span data-i18n="pwa.installDesc">装到桌面 / 手机桌面，像普通软件一样打开，断网也能用</span></span>
+    <button class="btn btn-sm btn-primary" id="installNow" data-i18n="pwa.installNow">立即安装</button>
+    <button class="btn btn-sm" id="installLater" data-i18n="pwa.installLater">以后再说</button>
+  </div>
+
+  <!-- ================= 主体：左表单 / 右预览 ================= -->
+  <div class="app-body" id="appBody">
+    <!-- ===== 侧栏式导航（布局 B）：竖向菜单，选中/悬停时展开文字 ===== -->
+    <aside class="app-rail" id="appRail" aria-label="操作菜单">
+      <button class="rail-toggle" id="railToggle" title="收起 / 展开菜单（Ctrl+B）" aria-label="切换菜单"><span class="ico">☰</span></button>
+
+      <div class="rail-group">
+        <div class="rail-label" data-i18n="rail.create">新建与生成</div>
+        <button class="rail-item rail-primary" id="railNew"><span class="ico">＋</span><span class="txt" data-i18n="btn.new">新建</span></button>
+        <button class="rail-item" id="railGenerate"><span class="ico">🔗</span><span class="txt" data-i18n="gen.button">一键生成</span></button>
+        <button class="rail-item adv-only" id="railDuplicate"><span class="ico">⧉</span><span class="txt" data-i18n="btn.copy">复制单据</span></button>
+      </div>
+
+      <div class="rail-group">
+        <div class="rail-label" data-i18n="rail.nav">单据导航</div>
+        <button class="rail-item" id="railBack" hidden><span class="ico">↩</span><span class="txt" data-i18n="btn.back">返回</span></button>
+        <button class="rail-item" id="railNext" hidden><span class="ico">▶</span><span class="txt" data-i18n="btn.next">下一条</span></button>
+        <div class="rail-hint" id="railOrderHint" hidden></div>
+      </div>
+
+      <div class="rail-group rail-grow">
+        <div class="rail-label" data-i18n="rail.status">单据状态</div>
+        <div class="rail-status"><span class="status-chip" id="railStatusChip" data-status="draft"></span></div>
+        <button class="rail-item rail-accent" id="railMarkSaved"><span class="ico">✅</span><span class="txt" data-i18n="btn.markSaved">标记为已保存</span></button>
+        <button class="rail-item" id="railBackDraft" hidden><span class="ico">✏️</span><span class="txt" data-i18n="btn.backToDraft">退回草稿继续改</span></button>
+        <div class="rail-save" id="railSaveState">● <span data-i18n="msg.autoSaved">已自动保存</span></div>
+      </div>
+
+      <div class="rail-group">
+        <div class="rail-label" data-i18n="rail.view">视图</div>
+        <button class="rail-item" id="railTogglePreview"><span class="ico">👁</span><span class="txt" data-i18n="prev.hide">隐藏预览</span></button>
+      </div>
+
+      <div class="rail-group">
+        
+      </div>
+
+      <div class="rail-group">
+        <button class="rail-item" id="railHelp"><span class="ico">💡</span><span class="txt" data-i18n="help.btn">使用帮助</span></button>
+        <button class="rail-item" id="railDrafts"><span class="ico">🗂</span><span class="txt" data-i18n="drafts.title">草稿与单据</span></button>
+        <button class="rail-item" id="railLibrary"><span class="ico">📚</span><span class="txt">模板库</span></button>
+        <button class="rail-item" id="railSettings"><span class="ico">⚙</span><span class="txt" data-i18n="set.title">设置</span></button>
+      </div>
+    </aside>
+
+    <!-- 左：编辑区 -->
+    <section class="pane pane-left" id="paneLeft">
+      <!-- 手机端单据类型选择器（桌面隐藏）：顶部页签在窄屏放不下，改用这个 5 格选择条 -->
+      <nav class="mobile-docbar" id="mobileDocbar" aria-label="单据类型"></nav>
+      <div class="left-toolbar">
+        <button class="btn btn-sm" id="btnDocCenter" title="单据中心：查看/搜索/批量处理所有单据">📚 <span>单据中心</span></button>
+        <button class="btn btn-primary btn-sm" id="btnNew">＋ <span data-i18n="btn.new">新建</span></button>
+        <button class="btn btn-sm" id="btnGenerate">🔗 <span data-i18n="gen.button">一键生成</span></button>
+        <button class="btn btn-sm adv-only" id="btnDuplicate" title="复制成一张新的同类单据">⧉ <span data-i18n="btn.copy">复制单据</span></button>
+          <button class="btn btn-sm" id="btnExcel" hidden title="导出 Excel 表格（三张工作表：信息 / 明细 / 合计）">📊 Excel</button>
+        <!-- 同类单据之间翻看：只有同类型有 2 张以上才出现，文案是「上一条 / 第 n/m 条 / 下一条」 -->
+        <span class="doc-nav" id="docNav" hidden>
+          <button class="doc-nav-btn" id="btnBack" title="上一条同类单据"><span class="ico">‹</span><span class="btn-label-back" data-i18n="btn.back">上一条</span></button>
+          <span class="doc-nav-pos" id="orderHint"></span>
+          <button class="doc-nav-btn" id="btnNext" title="下一条同类单据"><span class="btn-label-next" data-i18n="btn.next">下一条</span><span class="ico">›</span></button>
+        </span>
+        <div class="spacer"></div>
+        <button class="btn btn-sm check-chip" id="btnCheck" title="检查单据有没有填错、漏填、编号重复">
+          <span class="check-ico">🛡</span> <span data-i18n="check.button">检查</span>
+          <span class="check-badge" id="checkBadge" hidden></span>
+        </button>
+        <span class="status-chip" id="statusChip" data-status="draft"></span>
+        <button class="btn btn-sm btn-accent" id="btnMarkSaved"><span data-i18n="btn.markSaved">标记为已保存</span></button>
+        <button class="btn btn-sm" id="btnBackDraft" hidden><span data-i18n="btn.backToDraft">退回草稿继续改</span></button>
+        <span class="save-state" id="saveState">● <span data-i18n="msg.autoSaved">已自动保存</span></span>
+      </div>
+      <div id="formHost"></div>
+    </section>
+
+    <!-- 左右分栏的拖拽条：拖动可调整编辑区宽度（预览随动缩小） -->
+    <div class="splitter" id="splitter" title="拖动调整左侧宽度（双击还原）" role="separator" aria-orientation="vertical">
+      <span class="grip"></span>
+    </div>
+
+    <!-- 右：实时预览 -->
+    <section class="pane pane-right" id="paneRight">
+      <div class="preview-toolbar">
+        <!-- 左边一组：预览相关的（缩放 / 平移 / 字号）。装不下时这一组内部横向滚动，
+             右边的「打印 / 导出 PDF」永远留在可视区，不会被挤出去 -->
+        <div class="tb-tools">
+        <div class="zoom-group">
+          <button id="zoomOut" title="缩小" aria-label="缩小">−</button>
+          <span class="zoom-value" id="zoomValue">87%</span>
+          <button id="zoomIn" title="放大" aria-label="放大">＋</button>
+        </div>
+        <!-- 放大后预览比可视区宽时，用这两个按钮左右平移（不依赖系统滚动条） -->
+        <span class="pan-group" id="panGroup" hidden>
+          <button class="btn btn-sm" id="panLeft" title="向左移（也可按住预览拖动 / Shift+滚轮）">◀</button>
+          <button class="btn btn-sm" id="panRight" title="向右移（也可按住预览拖动 / Shift+滚轮）">▶</button>
+        </span>
+        <span class="ptb-sep" aria-hidden="true"></span>
+        <!-- 单据字号：只改单据里的文字，不改预览缩放；每个单据单独记，打印/PDF 同步 -->
+        <span class="font-group" title="单据字号：只影响单据里的文字大小，打印/PDF 同步；每个单据单独记">
+          <span class="fg-label">字号</span>
+          <button class="btn btn-sm" id="fontOut" title="字号减小">A−</button>
+          <span class="fg-value" id="fontValue">100%</span>
+          <button class="btn btn-sm" id="fontIn" title="字号加大">A＋</button>
+          <button class="btn btn-sm btn-quiet" id="fontReset" title="恢复默认字号">↺</button>
+        </span>
+        </div>
+        <!-- 右边一组：始终可见 -->
+        <div class="tb-actions">
+        <select id="previewLang" title="单据语言" class="preview-lang"></select>
+        <!-- ⋯ 更多：把不常用的收起来，工具栏只留一行 -->
+        <span class="tb-more-wrap">
+          <button class="btn btn-sm btn-quiet" id="tbMore" title="更多：适合宽度 / 实际大小 / 隐藏预览" aria-haspopup="true" aria-expanded="false">⋯</button>
+          <div class="tb-more-menu" id="tbMoreMenu" hidden>
+            <button class="btn btn-sm btn-quiet" id="zoomFit" data-i18n="prev.fit">适合宽度</button>
+            <button class="btn btn-sm btn-quiet" id="zoom100" data-i18n="prev.actual">实际大小 100%</button>
+            <button class="btn btn-sm btn-quiet" id="btnHidePreview" title="隐藏右侧预览，专心填表（Ctrl+\ 切换）">👁 <span data-i18n="prev.hide">隐藏预览</span></button>
+          </div>
+        </span>
+    <span class="hint" id="langFixedHint" hidden style="font-size:11.5px;color:var(--c-text-mute);white-space:nowrap"></span>
+        <button class="btn btn-sm" id="btnPrint">🖨 <span data-i18n="btn.print">打印</span>
+        </button>
+        <!-- 导出 PDF（Word / Excel / CSV / HTML 暂时隐藏，代码保留，见 initExportMenu） -->
+        <div class="export-group" id="exportGroup">
+          <button class="btn btn-primary btn-sm" id="btnPdf" title="导出 PDF（矢量，发给客户）">⬇ <span data-i18n="btn.exportPdf">导出 PDF</span>
+          </button>
+          <button class="btn btn-primary btn-sm" id="btnExportMore" title="更多导出格式（Excel 等）" aria-haspopup="true" aria-expanded="false">▾</button>
+          <div class="export-menu" id="exportMenu" popover="auto" hidden>
+            <div class="em-ttl" data-i18n="exp.title">导出为</div>
+            <button type="button" data-exp="pdf"><span class="ico">📄</span><span class="tx"><b data-i18n="btn.exportPdf">导出 PDF</b><i data-i18n="exp.pdfDesc">矢量 PDF，发给客户用</i></span></button>
+            <button type="button" data-exp="word" hidden><span class="ico">📝</span><span class="tx"><b data-i18n="exp.word">Word 文档</b><i data-i18n="exp.wordDesc">可编辑的 .docx</i></span></button>
+            <button type="button" data-exp="excel" hidden><span class="ico">📊</span><span class="tx"><b data-i18n="exp.excel">Excel 表格</b><i data-i18n="exp.excelDesc">三张工作表</i></span></button>
+            <button type="button" data-exp="csv" hidden><span class="ico">📑</span><span class="tx"><b data-i18n="exp.csv">CSV 明细</b><i data-i18n="exp.csvDesc">纯产品明细</i></span></button>
+            <button type="button" data-exp="html" hidden><span class="ico">🌐</span><span class="tx"><b data-i18n="exp.html">网页文件</b><i data-i18n="exp.htmlDesc">单个 HTML</i></span></button>
+          </div>
+        </div>
+        </div>
+      </div>
+      <div class="preview-scroll" id="previewScroll">
+        <div class="paper-shell" id="paperShell">
+          <div class="paper" id="paper">
+            <div class="empty-state">
+              <div class="ico">📄</div>
+              <div class="msg" data-i18n="drafts.empty">暂无草稿，点击「新建」开始</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 预览隐藏后剩下的细条：点一下就能把预览叫回来 -->
+    <div class="preview-stub" id="previewStub" hidden>👁 <span data-i18n="prev.show">显示预览</span></div>
+  </div>
+
+  <!-- ================= 手机底部 Tab ================= -->
+  <nav class="mobile-tabbar" id="mobileTabbar">
+    <button data-mtab="edit" class="active"><span class="ico">✏️</span><span data-i18n="mtab.edit">编辑</span></button>
+    <button data-mtab="preview"><span class="ico">👁</span><span data-i18n="mtab.preview">预览</span></button>
+    <button data-mtab="drafts"><span class="ico">🗂</span><span data-i18n="mtab.docs">单据</span></button>
+    <button data-mtab="more"><span class="ico">⋯</span><span data-i18n="mtab.more">更多</span></button>
+  </nav>
+
+  <!-- ================= 状态条 ================= -->
+  <div class="status-bar">
+    <span><span class="dot" id="netDot"></span><span id="netState">在线</span></span>
+    <span id="statusDoc">—</span>
+    <span class="status-chip" id="licChip" hidden style="cursor:pointer"></span>
+    <div class="spacer"></div>
+    <span id="statusStore" data-i18n="msg.storageOk">数据已保存在本机浏览器，未上传任何服务器</span>
+    <!-- 版本号 + 构建时间：用户装了两份时一眼能看出跑的是哪一版 -->
+    <span class="ver-tag" id="buildTag" title="版本与构建时间"></span>
+  </div>
+
+  <!-- ================= 抽屉：草稿 ================= -->
+  <aside class="drawer" id="drawerDrafts">
+    <div class="drawer-head">
+      <span data-i18n="drafts.title">草稿与单据</span>
+      <div class="spacer"></div>
+      <button class="btn btn-sm btn-primary" id="drawerNew">＋</button>
+      <button class="btn btn-sm" id="drawerDraftsClose">✕</button>
+    </div>
+    <div class="drawer-body">
+      <div class="seg-tabs seg-2" id="draftTabs">
+        <button data-tab="draft" class="active">
+          <span class="lb" data-i18n="drafts.tabDrafts">草稿</span>
+          <span class="cnt" id="cntDraft">0</span>
+        </button>
+        <button data-tab="saved">
+          <span class="lb" data-i18n="drafts.tabSaved">已保存单据</span>
+          <span class="cnt" id="cntSaved">0</span>
+        </button>
+      </div>
+
+      <!-- 按单据类型分开：全部 / 报价单 / 形式发票 / 销售合同 / 商业发票 / 装箱单 -->
+      <div class="type-chips" id="docTypeChips"></div>
+
+      <input type="search" id="draftSearch" data-i18n-placeholder="drafts.search" placeholder="搜索编号 / 客户" style="margin-bottom:9px" />
+      <div id="draftList"></div>
+      <!-- 历史快照：暂时隐藏（代码与逻辑保留，后续开发再放出来） -->
+      <div id="revisionSection" hidden>
+        <div class="card-head" style="margin:6px 0 8px;border-radius:6px;border:1px solid var(--c-border)">
+          <span data-i18n="drafts.history">历史快照</span>
+          <div class="spacer"></div>
+          <span class="hint" id="revCount"></span>
+        </div>
+        <div id="revisionList"><div class="empty-state" style="padding:18px"><div class="msg" data-i18n="msg.noData">暂无数据</div></div></div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ================= 抽屉：模板库 ================= -->
+  <aside class="drawer" id="drawerLibrary">
+    <div class="drawer-head">
+      <span>📚 模板库 / 资料库</span>
+      <div class="spacer"></div>
+      <button class="btn btn-sm" id="drawerLibraryClose">✕</button>
+    </div>
+    <div class="drawer-body">
+      <div class="seg-tabs seg-5" id="libTabs">
+        <button data-tab="profiles" class="active"><span class="ico">🏢</span><span class="lb">公司</span><span class="cnt" id="cntProfiles">0</span></button>
+        <button data-tab="customers"><span class="ico">👥</span><span class="lb">客户</span><span class="cnt" id="cntCustomers">0</span></button>
+        <button data-tab="products"><span class="ico">📦</span><span class="lb">产品</span><span class="cnt" id="cntProducts">0</span></button>
+        <button data-tab="banks"><span class="ico">🏦</span><span class="lb">银行</span><span class="cnt" id="cntBanks">0</span></button>
+        <button data-tab="clauses"><span class="ico">📑</span><span class="lb">条款</span><span class="cnt" id="cntClauses">0</span></button>
+      </div>
+
+      <!-- 收款银行（和常用公司一样，存好一键套用到单据） -->
+      <section data-libpanel="banks" hidden>
+        <div class="lib-head">
+          <span>🏦 收款银行</span>
+          <div class="spacer"></div>
+          <button class="btn btn-sm" id="libSaveBank">当前银行</button>
+          <button class="btn btn-sm btn-accent" id="libAddBank">＋ 新增</button>
+        </div>
+        <div class="hint" style="font-size:12px;color:var(--c-text-mute);margin:0 0 9px">
+          存好后在单据「银行信息」区点「🏦 从银行库选择」，一键填好收款人 / 开户行 / 账号 / SWIFT。
+        </div>
+        <div id="libBanks" style="padding:0"></div>
+      </section>
+
+      <!-- 常用公司（卖方抬头历史，可增删改） -->
+      <section data-libpanel="profiles">
+        <div class="lib-head">
+          <span>🏢 常用公司（卖方抬头）</span>
+          <div class="spacer"></div>
+          <button class="btn btn-sm btn-accent" id="libAddProfile">＋ 新增</button>
+        </div>
+        <div class="hint" style="font-size:12px;color:var(--c-text-mute);margin:0 0 9px">
+          存好后在单据卖方区点「🏢 从常用公司选择」，一键填好整栏（含 LOGO）。可修改、可删除。
+        </div>
+        <div id="libProfiles" style="padding:0"></div>
+      </section>
+
+      <section data-libpanel="customers" hidden>
+        <div class="lib-head">
+          <span>👥 客户库</span>
+          <div class="spacer"></div>
+          <button class="btn btn-sm" id="libSaveCustomer">当前买方</button>
+          <button class="btn btn-sm btn-accent" id="libAddCustomer">＋ 新增</button>
+        </div>
+        <div id="libCustomers" style="padding:0"></div>
+      </section>
+
+      <section data-libpanel="products" hidden>
+        <div class="lib-head">
+          <span>📦 产品库</span>
+          <div class="spacer"></div>
+          <button class="btn btn-sm" id="libSaveProducts">当前产品行</button>
+          <button class="btn btn-sm btn-accent" id="libAddProduct">＋ 新增</button>
+        </div>
+        <div id="libProducts" style="padding:0"></div>
+      </section>
+
+      <section data-libpanel="clauses" hidden>
+        <div class="lib-head">
+          <span>📑 条款模板库</span>
+          <div class="spacer"></div>
+          <button class="btn btn-sm" id="libSaveClause">当前条款</button>
+          <button class="btn btn-sm btn-accent" id="libAddClause">＋ 新增</button>
+        </div>
+        <div id="libClauses" style="padding:0"></div>
+      </section>
+    </div>
+  </aside>
+
+  <!-- ================= 弹层容器 ================= -->
+  <div id="modalHost"></div>
+
+  <!-- ================= 单据检查结果 ================= -->
+  <div class="check-panel" id="checkPanel" popover="auto">
+    <div class="check-head">
+      <b data-i18n="check.title">单据检查</b>
+      <span class="check-sum" id="checkSum"></span>
+      <button class="btn btn-sm" id="checkClose">✕</button>
+    </div>
+    <div class="check-body" id="checkBody"></div>
+    <div class="check-foot">
+      <span class="hint" data-i18n="check.footHint">点任意一条可直接跳到对应输入框</span>
+      <button class="btn btn-sm" id="checkRecheck" data-i18n="check.recheck">重新检查</button>
+    </div>
+  </div>
+
+  <!-- ================= Toast ================= -->
+  <div class="toast-host" id="toastHost"></div>
+
+  <!-- ================= 隐藏文件输入 ================= -->
+  <input type="file" id="fileLogo" accept="image/*" class="hidden" />
+  <input type="file" id="filePhoto" accept="image/*" class="hidden" />
+  <input type="file" id="fileStamp" accept="image/png,image/webp,image/gif,image/svg+xml,image/*" class="hidden" />
+  <input type="file" id="fileImport" accept="application/json,.json" class="hidden" />
+
+  <noscript>
+    <div style="padding:24px;text-align:center">本工具需要启用 JavaScript 才能运行（数据保存于本机，完全离线）。</div>
+  </noscript>
+
+  <div id="printRoot" class="hidden"></div>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
