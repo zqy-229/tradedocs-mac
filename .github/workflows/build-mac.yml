@@ -31,31 +31,36 @@ jobs:
       - name: Install deps
         run: npm install --no-audit --no-fund
 
-      - name: Build dmg
+      - name: Build dmg + zip
         run: npx electron-builder --mac --${{ matrix.arch }} --publish never
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
 
-      - name: Rename with edition label
+      - name: Rename with edition label + checksums
         run: |
           ls -lh release || true
-          for f in release/*.dmg; do
+          for f in release/*.dmg release/*.zip; do
             [ -e "$f" ] || continue
             base=$(basename "$f")
+            ext="${base##*.}"
             case "${{ matrix.edition }}" in
               classic) new="TradeDocs-classic-${base#TradeDocs-}" ;;
               salesinvoice) new="TradeDocs-salesinvoice-${base#TradeDocs-}" ;;
             esac
             mv "$f" "release/$new"
-            echo "renamed -> $new"
           done
-          ls -lh release || true
+          cd release
+          shasum -a 256 *.dmg *.zip 2>/dev/null | tee SHA256SUMS.txt || true
+          ls -lh
 
-      - name: Upload dmg artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.edition }}-mac-${{ matrix.arch }}
-          path: ${{ matrix.edition }}/release/*.dmg
+          path: |
+            ${{ matrix.edition }}/release/*.dmg
+            ${{ matrix.edition }}/release/*.zip
+            ${{ matrix.edition }}/release/SHA256SUMS.txt
           if-no-files-found: warn
 
   release:
@@ -71,16 +76,31 @@ jobs:
       - name: Show files
         run: ls -lh dist
 
+      - name: Build release notes with checksums
+        run: |
+          {
+            echo "经典版 + 销售发票版 · macOS（arm64 / x64）"
+            echo ""
+            echo "**装之前先核对 sha256**（终端：\`shasum -a 256 文件名\`），对不上说明没下完。"
+            echo ""
+            echo '```'
+            cat dist/SHA256SUMS.txt 2>/dev/null || echo "(no checksums)"
+            echo '```'
+            echo ""
+            echo "首次打开（未签名）：右键 → 打开；或 \`xattr -dr com.apple.quarantine /Applications/TradeDocs.app\`"
+          } > NOTES.md
+          cat NOTES.md
+
       - name: Create / update release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: mac-${{ github.run_number }}
           name: TradeDocs macOS build #${{ github.run_number }}
-          body: |
-            经典版 + 销售发票版 · macOS（arm64 / x64）
-            未签名：首次打开请右键 → 打开，或终端执行
-            `xattr -dr com.apple.quarantine /Applications/TradeDocs.app`
-          files: dist/*.dmg
+          body_path: NOTES.md
+          files: |
+            dist/*.dmg
+            dist/*.zip
+            dist/SHA256SUMS.txt
           draft: false
           prerelease: false
         env:
